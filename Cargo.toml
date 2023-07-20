@@ -1,0 +1,32 @@
+[package]
+name = "lib-mssql"
+version = "0.1.1"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+members = [
+
+]
+
+[workspace.dependencies]
+tiberius = { version = "0.12.2", default-features = false, features = ["sql-browser-tokio","time","chrono","rustls","rustls-native-certs","bigdecimal","tds73"] }
+
+[dependencies]
+async-trait = "0.1.71"
+chrono = "0.4.26"
+
+num-traits = "0.2.15"
+futures-core = "0.3.28"
+kanal = "0.1.0-pre8"
+
+deadpool = { version = "0.9.5", features = ["rt_tokio_1"] }
+rayon = "1.7.0"
+serde = { version = "1.0.166", features = ["derive"] }
+serde_derive = "1.0.166"
+serde_json = "1.0.100"
+tiberius = { workspace = true }
+tokio = { version = "1.29.1", features = ["full"] }
+tokio-util = "0.7.8"
+sea-query = { git="https://github.com/mjm918/sea-query.git", rev = "129d304", features = ["thread-safe","backend-mssql","with-uuid","with-chrono"] }
