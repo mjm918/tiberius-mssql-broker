@@ -4,13 +4,16 @@ pub mod deadpool;
 pub mod decode;
 pub mod encode;
 pub mod error;
+pub mod broker;
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::sync::{Arc, Mutex};
 pub use sea_query;
 
 use futures_core::Stream;
-use tiberius::{Client, Query};
+use kanal::Sender;
+use tiberius::{Client, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
 use rayon::prelude::*;
@@ -20,6 +23,8 @@ use crate::decode::Decode;
 use crate::encode::Encode;
 use crate::error::Error;
 use sea_query::Value;
+use tokio::task::JoinHandle;
+use crate::broker::Broker;
 use crate::connection::LongPooling;
 
 #[derive(Debug)]
@@ -144,5 +149,21 @@ impl MssqlConnection {
 			v.close().await.map_err(|e|Error::from(e))?;
 		}
 		Ok(())
+	}
+
+	pub async fn listen(mut self, id: u64, table: String, sx: Sender<Vec<Vec<Row>>>) -> Result<JoinHandle<()>, Error> {
+		let pool = self.pool
+			.expect("Mssql connection pool is not created");
+		let cfg = self.cfg.clone();
+		let mut broker = Broker::new(
+			pool,
+			cfg,
+			table,
+			id,
+			sx
+		);
+		Ok(tokio::spawn(async move {
+			broker.start().await.expect("start listening");
+		}))
 	}
 }
