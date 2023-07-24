@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-	use lib_mssql::config::SqlConfig;
-	use lib_mssql::connection::{client, LongPooling};
+	use tiberius_mssql_broker::config::SqlConfig;
+	use tiberius_mssql_broker::connection::{client, LongPooling};
 
 	fn config() -> SqlConfig {
 		let config = SqlConfig {
@@ -13,7 +13,7 @@ mod tests {
 			database: "AED_MOBILE".to_string(),
 			trust_cert: true,
 			allow_encrypt: true,
-			max_pool: 0,
+			max_pool: 1,
 			sql_browser: false,
 		};
 		config
@@ -57,7 +57,7 @@ mod tests {
 
 		let mut client = client.unwrap();
 		let res = client.simple_query(r#"
-			SELECT * FROM Accounts;
+			SELECT * FROM IV;
 		"#).await;
 
 		let res = res.unwrap();

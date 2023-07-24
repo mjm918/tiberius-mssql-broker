@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-	use lib_mssql::broker::ListenEvent;
-	use lib_mssql::config::SqlConfig;
-	use lib_mssql::MssqlConnection;
+	use tiberius_mssql_broker::broker::ListenEvent;
+	use tiberius_mssql_broker::config::SqlConfig;
+	use tiberius_mssql_broker::MssqlConnection;
 
 	#[tokio::test]
 	async fn test() {
