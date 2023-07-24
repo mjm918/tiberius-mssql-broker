@@ -5,14 +5,16 @@ mod tests {
 
 	fn config() -> SqlConfig {
 		let config = SqlConfig {
-			host: "d3.qne.cloud".to_string(),
+			host: ".".to_string(),
+			instance: Some("SQLEXPRESS".to_string()),
 			port: 1433,
-			username: "qnebss@qned3".to_string(),
-			password: "QnE123!@#".to_string(),
-			database: "OUC4Qy".to_string(),
+			username: "sa".to_string(),
+			password: "julfikar123@".to_string(),
+			database: "AED_MOBILE".to_string(),
 			trust_cert: true,
 			allow_encrypt: true,
 			max_pool: 0,
+			sql_browser: false,
 		};
 		config
 	}
@@ -26,7 +28,7 @@ mod tests {
 
 		let mut conn = conn.unwrap();
 
-		let res = conn.simple_query("select * from accounts;").await;
+		let res = conn.simple_query("select * from IV;").await;
 		assert!(res.is_ok(),"{:?}",res.err());
 	}
 

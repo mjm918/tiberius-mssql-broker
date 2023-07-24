@@ -7,6 +7,7 @@ mod tests {
 	async fn test() {
 		let config = SqlConfig {
 			host: "d3.qne.cloud".to_string(),
+			instance: None,
 			port: 1433,
 			username: "qnebss@qned3".to_string(),
 			password: "QnE123!@#".to_string(),
@@ -14,6 +15,7 @@ mod tests {
 			trust_cert: true,
 			allow_encrypt: true,
 			max_pool: 10,
+			sql_browser: false,
 		};
 
 		let mssql = MssqlConnection::establish(&config).await;

@@ -1,437 +1,316 @@
-use tiberius::{Result, error::Error, ExecuteResult, Row};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use log::{error, trace};
+use serde_json::Value as Json;
+use tiberius::{error::Error, ExecuteResult, Result};
+
+use crate::cnv;
 use crate::config::SqlConfig;
 use crate::connection::LongPooling;
-use crate::deadpool::Manager;
+use crate::decode::Decode;
+use crate::json_ext::{JsonExt, JsonMapExt};
+use crate::value::Value;
 
-pub enum ActionType {
-	None,
-	Insert,
-	Update,
-	Delete
+#[derive(Debug)]
+pub struct ListenEvent {
+    pub inserted: Option<Vec<HashMap<String, Value>>>,
+    pub updated: Option<Vec<HashMap<String, Value>>>,
+    pub deleted: Option<Vec<HashMap<String, Value>>>,
 }
 
-pub const INSERT_TAG: &str = "inserted";
-pub const DELETE_TAG: &str = "deleted";
-
-pub const SQL_PERMISSIONS_INFO: &str = r#"
-	DECLARE @msg VARCHAR(MAX)
-	DECLARE @crlf CHAR(1)
-	SET @crlf = CHAR(10)
-	SET @msg = 'Current user must have following permissions: '
-	SET @msg = @msg + '[CREATE PROCEDURE, CREATE SERVICE, CREATE QUEUE, SUBSCRIBE QUERY NOTIFICATIONS, CONTROL, REFERENCES] '
-	SET @msg = @msg + 'that are required to start query notifications. '
-	SET @msg = @msg + 'Grant described permissions with following script: ' + @crlf
-	SET @msg = @msg + 'GRANT CREATE PROCEDURE TO [<username>];' + @crlf
-	SET @msg = @msg + 'GRANT CREATE SERVICE TO [<username>];' + @crlf
-	SET @msg = @msg + 'GRANT CREATE QUEUE  TO [<username>];' + @crlf
-	SET @msg = @msg + 'GRANT REFERENCES ON CONTRACT::[DEFAULT] TO [<username>];' + @crlf
-	SET @msg = @msg + 'GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [<username>];' + @crlf
-	SET @msg = @msg + 'GRANT CONTROL ON SCHEMA::[<schemaname>] TO [<username>];'
-
-	PRINT @msg
-"#;
-
-pub const SQL_FORMAT_CREATE_INSTALLATION_PROCEDURE: &str = r#"
-	USE [<database>]
-	<permission_info>
-	IF OBJECT_ID ('<schema>.<proc>', 'P') IS NULL
-		BEGIN
-			EXEC ('
-				CREATE PROCEDURE <schema>.<proc>
-				AS
-				BEGIN
-					-- Service Broker configuration statement.
-					<broker_config>
-					-- Notification Trigger check statement.
-					<notification_trigger>
-					-- Notification Trigger configuration statement.
-					DECLARE @triggerStatement NVARCHAR(MAX)
-					DECLARE @select NVARCHAR(MAX)
-					DECLARE @sqlInserted NVARCHAR(MAX)
-					DECLARE @sqlDeleted NVARCHAR(MAX)
-
-					SET @triggerStatement = N''<notification_config>''
-
-					SET @select = STUFF((SELECT '','' + ''['' + COLUMN_NAME + '']''
-										 FROM INFORMATION_SCHEMA.COLUMNS
-										 WHERE DATA_TYPE NOT IN  (''text'',''ntext'',''image'',''geometry'',''geography'') AND TABLE_SCHEMA = ''<schema>'' AND TABLE_NAME = ''<table>'' AND TABLE_CATALOG = ''<database>''
-										 FOR XML PATH ('''')
-										 ), 1, 1, '''')
-					SET @sqlInserted =
-						N''SET @retvalOUT = (SELECT '' + @select + N''
-											 FROM INSERTED
-											 FOR XML PATH(''''row''''), ROOT (''''inserted''''))''
-					SET @sqlDeleted =
-						N''SET @retvalOUT = (SELECT '' + @select + N''
-											 FROM DELETED
-											 FOR XML PATH(''''row''''), ROOT (''''deleted''''))''
-					SET @triggerStatement = REPLACE(@triggerStatement
-											 , ''%inserted_select_statement%'', @sqlInserted)
-					SET @triggerStatement = REPLACE(@triggerStatement
-											 , ''%deleted_select_statement%'', @sqlDeleted)
-					EXEC sp_executesql @triggerStatement
-				END
-				')
-		END
-"#;
-
-pub const SQL_FORMAT_CREATE_UNINSTALLATION_PROCEDURE: &str = r#"
-	USE [<database>]
-	<permission_info>
-	IF OBJECT_ID ('<schema>.<prev_proc>', 'P') IS NULL
-		BEGIN
-			EXEC ('
-				CREATE PROCEDURE <schema>.<prev_proc>
-				AS
-				BEGIN
-					-- Notification Trigger drop statement.
-					<uninstall_stmt>
-					-- Service Broker uninstall statement.
-					<notification_trigger_drop_stmt>
-					IF OBJECT_ID (''<schema>.<next_proc>'', ''P'') IS NOT NULL
-						DROP PROCEDURE <schema>.<next_proc>
-
-					DROP PROCEDURE <schema>.<prev_proc>
-				END
-				')
-		END
-"#;
-
-pub const SQL_FORMAT_INSTALL_SERVICE_BROKER_NOTIFICATION: &str = r#"
-	-- Setup Service Broker
-	IF EXISTS (SELECT * FROM sys.databases
-						WHERE name = '<database>' AND is_broker_enabled = 0)
-	BEGIN
-		ALTER DATABASE [<database>] SET SINGLE_USER WITH ROLLBACK IMMEDIATE
-		ALTER DATABASE [<database>] SET ENABLE_BROKER;
-		ALTER DATABASE [<database>] SET MULTI_USER WITH ROLLBACK IMMEDIATE
-		-- FOR SQL Express
-		ALTER AUTHORIZATION ON DATABASE::[<database>] TO [<user>]
-	END
-	-- Create a queue which will hold the tracked information
-	IF NOT EXISTS (SELECT * FROM sys.service_queues WHERE name = '<schema>.<queue>')
-		CREATE QUEUE <schema>.[<queue>]
-	-- Create a service on which tracked information will be sent
-	IF NOT EXISTS(SELECT * FROM sys.services WHERE name = '<schema>.<service>')
-		CREATE SERVICE [<service>] ON QUEUE <schema>.[<queue>] ([DEFAULT])
-"#;
-
-pub const SQL_FORMAT_UNINSTALL_SERVICE_BROKER_NOTIFICATION: &str = r#"
-	DECLARE @serviceId INT
-	SELECT @serviceId = service_id FROM sys.services
-	WHERE sys.services.name = '<service>'
-	DECLARE @ConvHandle uniqueidentifier
-	DECLARE Conv CURSOR FOR
-	SELECT CEP.conversation_handle FROM sys.conversation_endpoints CEP
-	WHERE CEP.service_id = @serviceId AND ([state] != 'CD' OR [lifetime] > GETDATE() + 1)
-	OPEN Conv;
-	FETCH NEXT FROM Conv INTO @ConvHandle;
-	WHILE (@@FETCH_STATUS = 0) BEGIN
-		END CONVERSATION @ConvHandle WITH CLEANUP;
-		FETCH NEXT FROM Conv INTO @ConvHandle;
-	END
-	CLOSE Conv;
-	DEALLOCATE Conv;
-	-- Droping service and queue.
-	IF (@serviceId IS NOT NULL)
-		DROP SERVICE [<service>];
-	IF OBJECT_ID ('<schema>.<queue>', 'SQ') IS NOT NULL
-		DROP QUEUE <schema>.[<queue>];
-"#;
-
-pub const SQL_FORMAT_DELETE_NOTIFICATION_TRIGGER:&str = r#"
-	IF OBJECT_ID ('<schema>.<trigger>', 'TR') IS NOT NULL
-                    DROP TRIGGER <schema>.[<trigger>];
-"#;
-
-pub const SQL_FORMAT_CHECK_NOTIFICATION_TRIGGER: &str = r#"
-	IF OBJECT_ID ('<schema>.<trigger>', 'TR') IS NOT NULL
-                    RETURN;
-"#;
-
-pub const SQL_FORMAT_CREATE_NOTIFICATION_TRIGGER: &str = r#"
-	CREATE TRIGGER [<trigger>]
-	ON <schema>.[<table>]
-	AFTER INSERT, DELETE, UPDATE
-	AS
-	SET NOCOUNT ON;
-	--Trigger <table> is rising...
-	IF EXISTS (SELECT * FROM sys.services WHERE name = '<conversation>')
-	BEGIN
-		DECLARE @message NVARCHAR(MAX)
-		SET @message = N'<root/>'
-		IF (<tracking_mode> EXISTS(SELECT 1))
-		BEGIN
-			DECLARE @retvalOUT NVARCHAR(MAX)
-			%inserted_select_statement%
-			IF (@retvalOUT IS NOT NULL)
-			BEGIN SET @message = N'<root>' + @retvalOUT END
-			%deleted_select_statement%
-			IF (@retvalOUT IS NOT NULL)
-			BEGIN
-				IF (@message = N'<root/>') BEGIN SET @message = N'<root>' + @retvalOUT END
-				ELSE BEGIN SET @message = @message + @retvalOUT END
-			END
-			IF (@message != N'<root/>') BEGIN SET @message = @message + N'</root>' END
-		END
-		--Beginning of dialog...
-		DECLARE @ConvHandle UNIQUEIDENTIFIER
-		--Determine the Initiator Service, Target Service and the Contract
-		BEGIN DIALOG @ConvHandle
-			FROM SERVICE [<conversation>] TO SERVICE '<conversation>' ON CONTRACT [DEFAULT] WITH ENCRYPTION=OFF, LIFETIME = 60;
-		--Send the Message
-		SEND ON CONVERSATION @ConvHandle MESSAGE TYPE [DEFAULT] (@message);
-		--End conversation
-		END CONVERSATION @ConvHandle;
-	END
-"#;
-
-pub const SQL_FORMAT_RECEIVE_EVENT: &str = r#"
-	DECLARE @ConvHandle UNIQUEIDENTIFIER
-	DECLARE @message VARBINARY(MAX)
-	USE [<database>]
-	WAITFOR (RECEIVE TOP(1) @ConvHandle=Conversation_Handle
-				, @message=message_body FROM <schema>.[<conversation>]), TIMEOUT 60000;
-	BEGIN TRY END CONVERSATION @ConvHandle; END TRY BEGIN CATCH END CATCH
-	SELECT CAST(@message AS NVARCHAR(MAX))
-"#;
-
-pub const SQL_FORMAT_EXECUTE_PROCEDURE: &str = r#"
-	USE [<database>]
-	IF OBJECT_ID ('<schema>.<proc>', 'P') IS NOT NULL
-		EXEC <schema>.<proc>
-"#;
-
-pub const SQL_FORMAT_GET_DEPENDENCY_IDENTITIES: &str = r#"
-	USE [<database>]
-
-	SELECT REPLACE(name , 'ListenerService_' , '')
-	FROM sys.services
-	WHERE [name] like 'ListenerService_%';
-"#;
-
-pub const SQL_FORMAT_FORCED_DATABASE_CLEANING: &str = r#"
-	USE [<database>]
-	DECLARE @db_name VARCHAR(MAX)
-	SET @db_name = '<database>' -- provide your own db name
-	DECLARE @proc_name VARCHAR(MAX)
-	DECLARE procedures CURSOR
-	FOR
-	SELECT   sys.schemas.name + '.' + sys.objects.name
-	FROM    sys.objects
-	INNER JOIN sys.schemas ON sys.objects.schema_id = sys.schemas.schema_id
-	WHERE sys.objects.[type] = 'P' AND sys.objects.[name] like 'sp_UninstallListenerNotification_%'
-	OPEN procedures;
-	FETCH NEXT FROM procedures INTO @proc_name
-	WHILE (@@FETCH_STATUS = 0)
-	BEGIN
-	EXEC ('USE [' + @db_name + '] EXEC ' + @proc_name + ' IF (OBJECT_ID ('''
-					+ @proc_name + ''', ''P'') IS NOT NULL) DROP PROCEDURE '
-					+ @proc_name)
-	FETCH NEXT FROM procedures INTO @proc_name
-	END
-	CLOSE procedures;
-	DEALLOCATE procedures;
-	DECLARE procedures CURSOR
-	FOR
-	SELECT   sys.schemas.name + '.' + sys.objects.name
-	FROM    sys.objects
-	INNER JOIN sys.schemas ON sys.objects.schema_id = sys.schemas.schema_id
-	WHERE sys.objects.[type] = 'P' AND sys.objects.[name] like 'sp_InstallListenerNotification_%'
-	OPEN procedures;
-	FETCH NEXT FROM procedures INTO @proc_name
-	WHILE (@@FETCH_STATUS = 0)
-	BEGIN
-	EXEC ('USE [' + @db_name + '] DROP PROCEDURE '
-					+ @proc_name)
-	FETCH NEXT FROM procedures INTO @proc_name
-	END
-	CLOSE procedures;
-	DEALLOCATE procedures;
-"#;
-
-pub const SQL_FORMAT_INSTALL_SEVICE_BROKER_NOTIFICATION: &str = r#"
-	-- Setup Service Broker
-	IF EXISTS (SELECT * FROM sys.databases
-						WHERE name = '<database>' AND is_broker_enabled = 0)
-	BEGIN
-		ALTER DATABASE [<database>] SET SINGLE_USER WITH ROLLBACK IMMEDIATE
-		ALTER DATABASE [<database>] SET ENABLE_BROKER;
-		ALTER DATABASE [<database>] SET MULTI_USER WITH ROLLBACK IMMEDIATE
-		-- FOR SQL Express
-		ALTER AUTHORIZATION ON DATABASE::[<database>] TO [<user>]
-	END
-	-- Create a queue which will hold the tracked information
-	IF NOT EXISTS (SELECT * FROM sys.service_queues WHERE name = '<schema>.<queue>')
-		CREATE QUEUE <schema>.[<queue>]
-	-- Create a service on which tracked information will be sent
-	IF NOT EXISTS(SELECT * FROM sys.services WHERE name = '<schema>.<service>')
-		CREATE SERVICE [<service>] ON QUEUE <schema>.[<queue>] ([DEFAULT])
-"#;
-
 fn conversation_queue(name: &str) -> String {
-	format!("ListenerQueue_{}",name)
+    format!("ListenerQueue_{}", name)
 }
 
 fn conversation_service(name: &str) -> String {
-	format!("ListenerService_{}",name)
+    format!("ListenerService_{}", name)
 }
 
 fn conversation_trigger(name: &str) -> String {
-	format!("tr_Listener_{}",name)
+    format!("tr_Listener_{}", name)
 }
 
 fn install_proc_listener(name: &str) -> String {
-	format!("sp_InstallListenerNotification_{}",name)
+    format!("sp_InstallListenerNotification_{}", name)
 }
 
 fn uninstall_proc_listener(name: &str) -> String {
-	format!("sp_UninstallListenerNotification_{}",name)
+    format!("sp_UninstallListenerNotification_{}", name)
 }
 
-pub struct Broker<'a> {
-	pool: LongPooling,
-	cnf: SqlConfig,
-	schema: &'a str,
-	table: String,
-	identifier: u64,
-	producer: kanal::Sender<Vec<Vec<Row>>>
+const SCHEMA: &str = "dbo";
+
+pub struct Broker {
+    pool: LongPooling,
+    cnf: SqlConfig,
+    table: String,
+    identifier: u64,
+    producer: kanal::Sender<Vec<ListenEvent>>,
+    definition: HashMap<String, String>,
 }
 
-impl<'a> Broker<'a> {
-	pub fn new(
-		pool: LongPooling,
-		cnf: SqlConfig,
-		table: String,
-		identifier: u64,
-		producer: kanal::Sender<Vec<Vec<Row>>>
-	) -> Self {
-		Self {
-			pool,
-			cnf,
-			schema: "dbo",
-			table,
-			identifier,
-			producer
-		}
-	}
+impl Broker {
+    pub fn new(
+        pool: LongPooling,
+        cnf: SqlConfig,
+        table: String,
+        identifier: u64,
+        producer: kanal::Sender<Vec<ListenEvent>>,
+    ) -> Self {
+        Self {
+            pool,
+            cnf,
+            table,
+            identifier,
+            producer,
+            definition: HashMap::new(),
+        }
+    }
 
-	pub async fn start(&mut self) -> std::result::Result<(), Error> {
-		self.stop().await?;
+    pub async fn start(&mut self) -> std::result::Result<(), Error> {
+        trace!("stopping previous listeners");
+        self.stop().await?;
 
-		let id = self.identifier.to_string();
-		let install_proc = install_proc_listener(id.as_str());
-		let sql = SQL_FORMAT_EXECUTE_PROCEDURE
-			.replace("<database>",self.cnf.database.as_str())
-			.replace("<proc>",install_proc.as_str())
-			.replace("<schema>",&self.schema);
+        trace!("installing procedures");
 
-		self.exec(self.install_proc_script().as_str()).await?;
-		self.exec(self.uninstall_proc_script().as_str()).await?;
-		self.exec(sql.as_str()).await?;
-		loop {
-			if let Ok(result) = self.receive_event().await {
-				self.producer.send(result).expect("send notification from broker");
-			}
-		}
-	}
+        let install_sql = Self::install_procedure_sql().expect("install procedure sql");
+        let uninstall_sql = Self::uninstall_procedure_sql().expect("uninstall procedure sql");
+        let call_procedure = Self::call_install_procedure_sql().expect("call procedure sql");
 
-	async fn receive_event(&mut self) -> Result<Vec<Vec<Row>>> {
-		let q = conversation_queue(self.identifier.to_string().as_str());
-		let sql = SQL_FORMAT_RECEIVE_EVENT
-			.replace("<database>",self.cnf.database.as_str())
-			.replace("<conversation>",&q)
-			.replace("<schema>",&self.schema);
-		let client = self.pool.client().await;
-		let mut conn = client.expect("Mssql Connection is closed");
-		let stream = conn.simple_query(sql.as_str()).await?;
-		let rows = stream
-			.into_results()
-			.await?;
-		Ok(rows)
-	}
+        self.exec(install_sql.as_str()).await?;
+        self.exec(uninstall_sql.as_str()).await?;
+        self.exec(call_procedure.as_str()).await?;
+        self.definitions().await?;
+        trace!("started listening to changes");
 
-	pub async fn stop(&mut self) -> Result<ExecuteResult> {
-		let id = self.identifier.to_string();
-		let uninstall_proc = uninstall_proc_listener(id.as_str());
-		let sql = SQL_FORMAT_EXECUTE_PROCEDURE
-			.replace("<database>",self.cnf.database.as_str())
-			.replace("<proc>",uninstall_proc.as_str())
-			.replace("<schema>",&self.schema);
+        loop {
+            match self.receive_event().await {
+                Ok(result) => {
+                    if result.len() > 0 {
+                        trace!("received {:?}", &result);
+                        self.producer.send(result).expect("send notification from sql");
+                    }
+                }
+                Err(err) => {
+                    trace!("{:?}",err);
+                }
+            }
+        }
+    }
 
-		self.exec(sql.as_str()).await
-	}
+    async fn receive_event(&mut self) -> Result<Vec<ListenEvent>> {
+        let q = conversation_queue(self.identifier.to_string().as_str());
+        let sql = r#"
+				DECLARE @ConvHandle UNIQUEIDENTIFIER
+				DECLARE @message VARBINARY(MAX)
+				USE [<database>]
+				WAITFOR (RECEIVE TOP(1) @ConvHandle=Conversation_Handle
+					, @message=message_body FROM <schema>.[<queue>]), TIMEOUT 60000;
+				BEGIN TRY END CONVERSATION @ConvHandle; END TRY BEGIN CATCH END CATCH
+				SELECT CAST(@message AS NVARCHAR(MAX))
+			"#
+            .replace("<database>", self.cnf.database.as_str())
+            .replace("<queue>", &q)
+            .replace("<schema>", &SCHEMA);
+        let client = self.pool.client().await;
+        let mut conn = client.expect("Mssql Connection is closed");
+        let stream = conn.simple_query(sql.as_str()).await?;
+        let rows = stream
+            .into_results()
+            .await?;
 
-	pub async fn clean(&mut self) -> Result<ExecuteResult> {
-		let sql = SQL_FORMAT_FORCED_DATABASE_CLEANING
-			.replace("<database>",self.cnf.database.as_str());
-		self.exec(sql.as_str()).await
-	}
+        let mut results = vec![];
+        for first in rows {
+            for row in first {
+                for column_data in row {
+                    let v = Value::decode(&column_data).unwrap();
+                    match v {
+                        Value::String(opt_xml) => {
+                            match opt_xml {
+                                None => {}
+                                Some(xml) => {
+                                    match quickxml_to_serde::xml_str_to_json(xml.as_ref(), &quickxml_to_serde::Config::new_with_defaults())/*serde_xml_rs::from_str::<Json>(xml.as_str())*/ {
+                                        Ok(json) => {
+                                            results.push(self.normalize(&json));
+                                        }
+                                        Err(_) => {}
+                                    };
+                                }
+                            }
+                        }
+                        _ => {
+                            error!("unexpected data {:?}",column_data)
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
 
-	async fn exec(&mut self, sql: &str) -> Result<ExecuteResult> {
-		println!("To Execute: {}",sql);
-		let client = self.pool.client().await;
-		let mut conn = client.expect("Mssql Connection is closed");
-		conn.execute("SELECT 1;", &[]).await
-	}
+    pub async fn stop(&mut self) -> Result<ExecuteResult> {
+        let sql = Self::call_uninstall_procedure_sql().expect("call uninstall procedure sql");
+        self.exec(sql.as_str()).await
+    }
 
-	fn install_proc_script(&self) -> String {
-		let id = self.identifier.to_string();
-		let p = install_proc_listener(id.as_str());
-		let c = conversation_trigger(id.as_str());
-		let q = conversation_queue(id.as_str());
-		let s = conversation_service(id.as_str());
+    pub async fn clean(&mut self) -> Result<ExecuteResult> {
+        let sql = Self::cleanup_sql().expect("cleanup sql");
+        self.exec(sql.as_str()).await
+    }
 
-		let install_service = SQL_FORMAT_INSTALL_SEVICE_BROKER_NOTIFICATION
-			.replace("<database>", self.cnf.database.as_str())
-			.replace("<user>",self.cnf.username.as_str())
-			.replace("<queue>",&q)
-			.replace("<service>",&s)
-			.replace("<schema>",&self.schema);
-		let install_trigger = SQL_FORMAT_CREATE_NOTIFICATION_TRIGGER
-			.replace("<table>",&self.table)
-			.replace("<conversation>",&s)
-			.replace("<trigger>",&s)
-			.replace("<tracking_mode>","")
-			.replace("<schema>",&self.schema);
-		let uninstall_trigger = SQL_FORMAT_CHECK_NOTIFICATION_TRIGGER
-			.replace("<trigger>",&c)
-			.replace("<schema>",&self.schema);
-		let install_proc = SQL_FORMAT_CREATE_INSTALLATION_PROCEDURE
-			.replace("<database>",self.cnf.database.as_str())
-			.replace("<permission_info>",SQL_PERMISSIONS_INFO)
-			.replace("<schema>",&self.schema)
-			.replace("<table>",&self.table)
-			.replace("<proc>",&p)
-			.replace("<broker_config>",install_service.replace("'", "''").as_str())
-			.replace("<notification_trigger>",install_trigger.replace("'", "''").as_str())
-			.replace("<notification_config>", uninstall_trigger.replace("'", "''").as_str());
+    async fn exec(&mut self, sql: &str) -> Result<ExecuteResult> {
+        let id = self.identifier.to_string();
+        let sql = sql
+            .replace("<database>", &self.cnf.database)
+            .replace("<user>", &self.cnf.username)
+            .replace("<procedure>", install_proc_listener(&id).as_str())
+            .replace("<uninstall_procedure>", uninstall_proc_listener(&id).as_str())
+            .replace("<service>", conversation_service(&id).as_str())
+            .replace("<queue>", conversation_queue(&id).as_str())
+            .replace("<trigger>", conversation_trigger(&id).as_str())
+            .replace("<schema>", &SCHEMA)
+            .replace("<table>", &self.table);
 
-		install_proc
-	}
+        trace!("To Execute: {}",sql);
 
-	fn uninstall_proc_script(&self) -> String {
-		let id = self.identifier.to_string();
-		let q = conversation_queue(id.as_str());
-		let s = conversation_service(id.as_str());
-		let t = conversation_trigger(id.as_str());
-		let u = uninstall_proc_listener(id.as_str());
-		let n = install_proc_listener(id.as_str());
-		let uninstall_service = SQL_FORMAT_UNINSTALL_SERVICE_BROKER_NOTIFICATION
-			.replace("<service>",&s)
-			.replace("<schema>",&self.schema)
-			.replace("<queue>",&q);
-		let uninstall_notification = SQL_FORMAT_DELETE_NOTIFICATION_TRIGGER
-			.replace("<trigger>",&t)
-			.replace("<schema>",&s);
-		let script = SQL_FORMAT_CREATE_UNINSTALLATION_PROCEDURE
-			.replace("<database>",self.cnf.database.as_str())
-			.replace("<prev_proc>",&u)
-			.replace("<next_proc>",&n)
-			.replace("<schema>",&self.schema)
-			.replace("<permission_info>",SQL_PERMISSIONS_INFO)
-			.replace("<notification_trigger_drop_stmt>",uninstall_service.as_str())
-			.replace("<uninstall_stmt>",uninstall_notification.as_str());
-		script
-	}
+        let client = self.pool.client().await;
+        let mut conn = client.expect("Mssql Connection is closed");
+        conn.execute(sql, &[]).await
+    }
+
+    pub async fn definitions(&mut self) -> Result<()> {
+        self.definition.clear();
+        let sql = r#"
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = 'IV' ORDER BY ORDINAL_POSITION;
+        "#;
+        let client = self.pool.client().await;
+        let mut conn = client.expect("Mssql Connection is closed");
+        let stream = conn.simple_query(sql).await?;
+        let rows = stream
+            .into_results()
+            .await?;
+        for first in rows {
+            for row in first {
+                let mut count = 0;
+                let mut column_name = format!("");
+                let mut type_def = format!("");
+
+                for column_data in row {
+                    let v = Value::decode(&column_data).unwrap();
+                    match v {
+                        Value::String(def) => {
+                            if count == 0 {
+                                column_name = format!("{}", def.unwrap());
+                            } else if count == 1 {
+                                type_def = format!("{}", def.unwrap());
+                            }
+                        }
+                        _ => {}
+                    }
+                    count += 1;
+                }
+                self.definition.insert(column_name, type_def);
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize(&self, root: &Json) -> ListenEvent {
+        let obj = root.to_object();
+        let value = obj.get_object("root");
+        let mut ev = ListenEvent {
+            inserted: None,
+            updated: None,
+            deleted: None,
+        };
+        match value.get("deleted") {
+            None => {}
+            Some(deleted) => {
+                trace!("received event [delete]");
+                ev.deleted = Some(self.parse_root_row(deleted));
+            }
+        }
+        match value.get("inserted") {
+            None => {}
+            Some(inserted) => {
+                trace!("received event [insert]");
+                ev.inserted = Some(self.parse_root_row(inserted));
+            }
+        }
+        match value.get("updated") {
+            None => {}
+            Some(updated) => {
+                trace!("received event [update]");
+                ev.updated = Some(self.parse_root_row(updated));
+            }
+        }
+        ev
+    }
+
+    fn parse_root_row(&self, value: &Json) -> Vec<HashMap<String, Value>> {
+        let action = value.to_object();
+        let rows = action.get_array("row");
+        let mut result = vec![];
+        for row in rows {
+            trace!("event [row] {:?}",&row);
+            result.push(self.parse_row(&row));
+        }
+        result
+    }
+
+    fn parse_row(&self, value: &Json) -> HashMap<String, Value> {
+        let hm = value.to_object();
+        let mut res = HashMap::new();
+        for (column, v) in hm {
+            let column_value = v.any_to_str();
+
+            let tmp = "".to_string();
+            let data_type = self.definition.get(column.as_str()).unwrap_or(&tmp);
+
+            let converted = cnv::convert_from_str_to_rusttype(column_value.as_str(), data_type);
+            trace!("converted value {:?}",converted);
+
+            res.insert(column.clone(), converted);
+        }
+        res
+    }
+
+    fn install_procedure_sql() -> std::io::Result<String> {
+        fs::read_to_string(Self::sql_path("install-procedure.sql"))
+    }
+
+    fn uninstall_procedure_sql() -> std::io::Result<String> {
+        fs::read_to_string(Self::sql_path("uninstall-procedure.sql"))
+    }
+
+    fn call_install_procedure_sql() -> std::io::Result<String> {
+        fs::read_to_string(Self::sql_path("call-install.sql"))
+    }
+
+    fn call_uninstall_procedure_sql() -> std::io::Result<String> {
+        fs::read_to_string(Self::sql_path("call-uninstall.sql"))
+    }
+
+    fn cleanup_sql() -> std::io::Result<String> {
+        fs::read_to_string(Self::sql_path("cleanup.sql"))
+    }
+
+    fn sql_path(name: &str) -> PathBuf {
+        let path = Path::new(".")
+            .join("sql")
+            .join(name);
+        path
+    }
 }
+
+/*impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = Box::new(async move {
+            self.stop().await
+        });
+    }
+}*/
