@@ -2,11 +2,24 @@
 
 Broker for MSSQL. Re-implementation of C# SQLDependencyEx.
 
-Thanks to deadpool-tiberius repository.
+Thanks to [deadpool-tiberius](https://github.com/Geo-W/deadpool-tiberius) and obviously [tiberius](https://github.com/prisma/tiberius) ❤️.
+
+**Note**
+
+Current user must have the following permissions:
+
+```
+CREATE PROCEDURE
+CREATE SERVICE
+CREATE QUEUE
+SUBSCRIBE QUERY NOTIFICATIONS
+CONTROL
+REFERENCES
+```
 
 # Example:
 
-**broker example**
+**Broker example**
 
 ```rust
 let mssql = MssqlConnection::establish(&SqlConfig{
@@ -45,7 +58,7 @@ match mssql {
 ```
 
 
-**query example**
+**Query example**
 
 ```rust
 let config = SqlConfig {

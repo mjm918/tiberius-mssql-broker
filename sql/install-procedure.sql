@@ -3,7 +3,7 @@ USE [<database>]
 DECLARE @msg  VARCHAR(MAX)
 DECLARE @crlf CHAR(1)
 SET @crlf = CHAR(10)
-SET @msg = 'Current user must have following permissions: '
+SET @msg = 'Current user must have the following permissions: '
 SET @msg = @msg +
            '[CREATE PROCEDURE, CREATE SERVICE, CREATE QUEUE, SUBSCRIBE QUERY NOTIFICATIONS, CONTROL, REFERENCES] '
 SET @msg = @msg + 'that are required to start query notifications. '
