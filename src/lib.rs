@@ -135,7 +135,7 @@ impl MssqlConnection {
         })
     }
 
-    async fn ping(&mut self) -> Result<(), Error> {
+    pub async fn ping(&mut self) -> Result<(), Error> {
         trace!("ping...");
         let ping = self.inner
             .as_mut().expect("Mssql Connection is closed")
