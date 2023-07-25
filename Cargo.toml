@@ -1,15 +1,15 @@
 [package]
 name = "tiberius-mssql-broker"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Mohammad Julfikar <julfikar@eztech.com.my>", "Mohammad Julfikar <md.julfikar.mahmud@gmail.com>"]
-categories = ["database-interfaces"]
+categories = ["database"]
 description = "Real time change listener for MSSQL"
 exclude = [
     ".idea",
     ".github"
 ]
-keywords = ["sqlserver","database","broker","mssql","tiberius","listener"]
+keywords = ["sqlserver","broker","mssql","tiberius","listener"]
 license = "Apache-2.0"
 repository = "https://github.com/mjm918/tiberius-mssql-broker"
 
