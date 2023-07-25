@@ -6,15 +6,15 @@ mod tests {
 	#[tokio::test]
 	async fn test() {
 		let config = SqlConfig {
-			host: "d3.qne.cloud".to_string(),
-			instance: None,
+			host: ".".to_string(),
+			instance: Some("SQLEXPRESS".to_string()),
 			port: 1433,
-			username: "qnebss@qned3".to_string(),
-			password: "QnE123!@#".to_string(),
-			database: "OUC4Qy".to_string(),
+			username: "sa".to_string(),
+			password: "julfikar123@".to_string(),
+			database: "AED_MOBILE".to_string(),
 			trust_cert: true,
 			allow_encrypt: true,
-			max_pool: 10,
+			max_pool: 1,
 			sql_browser: false,
 		};
 

@@ -6,8 +6,9 @@ Thanks to deadpool-tiberius repository.
 
 # Example:
 
+**broker example**
+
 ```rust
-// broker example 
 let mssql = MssqlConnection::establish(&SqlConfig{
     host: ".".to_string(),
     instance: Some("SQLEXPRESS".to_string()),
@@ -41,4 +42,28 @@ match mssql {
         println!("{:?}",err);
     }
 }
+```
+
+
+**query example**
+
+```rust
+let config = SqlConfig {
+    host: ".".to_string(),
+    instance: Some("SQLEXPRESS".to_string()),
+    port: 1433,
+    username: "sa".to_string(),
+    password: "julfikar123@".to_string(),
+    database: "AED_MOBILE".to_string(),
+    trust_cert: true,
+    allow_encrypt: true,
+    max_pool: 1,
+    sql_browser: false,
+};
+
+let mssql = MssqlConnection::establish(&config).await;
+let mut mssql = mssql.unwrap();
+
+let res = mssql.select("SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';", vec![]).await;
+let res: Vec<HashMap<String,Value>> = res.unwrap();
 ```
