@@ -182,11 +182,14 @@ impl Broker {
 
     pub async fn definitions(&mut self) -> Result<()> {
         self.definition.clear();
-        let sql = r#"
-            SELECT COLUMN_NAME, DATA_TYPE
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = 'IV' ORDER BY ORDINAL_POSITION;
-        "#;
+        let sql = format!(
+	        r#"
+	        SELECT COLUMN_NAME, DATA_TYPE
+	        FROM INFORMATION_SCHEMA.COLUMNS
+	        WHERE TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION;
+	        "#,
+	        self.table
+	    );
         let client = self.pool.client().await;
         let mut conn = client.expect("Mssql Connection is closed");
         let stream = conn.simple_query(sql).await?;
